@@ -6,334 +6,365 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <Python.h>
+#include <signal.h>
 
-#define PORT 9090
-#define BUFFER_SIZE 1024
-#define MAX_ROUTES 10
+#define DEFAULT_PORT  8000
+#define BUFFER_SIZE   4096
 
-typedef enum {
-    GET,
-    POST,
-    PUT,
-    DELETE,
-    PATCH,
-    UNKNOWN
-} http_method;
-
-typedef struct {
-    PyObject_HEAD
-    PyObject *router;
-} RouterObject;
+typedef enum { GET, POST, PUT, DELETE, PATCH, UNKNOWN } http_method;
 
 typedef struct {
     http_method method;
-    char *path_start;
-    size_t path_length; 
-    char *body_start;
-    size_t body_length;
-    int client_fd;
+    char       *path_start;
+    size_t      path_length;
+    char       *body_start;
+    size_t      body_length;
+    int         client_fd;
 } Request;
 
 typedef struct {
-    int client_fd;
-    PyObject *router;
+    int        client_fd;
+    PyObject  *routes;
 } ClientContext;
 
-http_method parse_method(char *buffer) {
-    if (strncmp(buffer, "GET", 3) == 0) {
-        return GET;
-    }
-    if (strncmp(buffer, "POST", 4) == 0) {
-        return POST;
-    }
-    if (strncmp(buffer, "PUT", 3) == 0) {
-        return PUT;
-    }
-    if (strncmp(buffer, "DELETE", 6) == 0) {
-        return DELETE;
-    }
-    if (strncmp(buffer, "PATCH", 5) == 0) {
-        return PATCH;
-    }
+
+http_method parse_method(char *buf) {
+    if (strncmp(buf, "GET",    3) == 0) return GET;
+    if (strncmp(buf, "POST",   4) == 0) return POST;
+    if (strncmp(buf, "PUT",    3) == 0) return PUT;
+    if (strncmp(buf, "DELETE", 6) == 0) return DELETE;
+    if (strncmp(buf, "PATCH",  5) == 0) return PATCH;
     return UNKNOWN;
 }
 
-void parse_path(char *buffer, Request *req) {
-    char *first_space = strchr(buffer, ' ');
-    if (!first_space) return;
-    
-    char *path_start = first_space + 1;
-    
-    char *second_space = strchr(path_start, ' ');
-    if (!second_space) return;
-    
-    size_t path_length = second_space - path_start;
-
-    req->path_length = path_length;
-    req->path_start = path_start;
-
-    return;
+void parse_path(char *buf, Request *req) {
+    char *s1 = strchr(buf, ' ');
+    if (!s1) return;
+    char *path = s1 + 1;
+    char *s2 = strchr(path, ' ');
+    if (!s2) return;
+    req->path_start  = path;
+    req->path_length = s2 - path;
 }
 
-const char *get_mime_type(const char *file_extension) {
-    if (strcmp(file_extension, "html") == 0) return "text/html";
-    if (strcmp(file_extension, "css") == 0) return "text/css";
-    if (strcmp(file_extension, "js") == 0) return "application/javascript";
-    if (strcmp(file_extension, "png") == 0) return "image/png";
-    if (strcmp(file_extension, "jpg") == 0 || strcmp(file_extension, "jpeg") == 0) return "image/jpeg";
-    if (strcmp(file_extension, "json") == 0) return "application/json";
-    if (strcmp(file_extension, "txt") == 0) return "text/plain";
-    if (strcmp(file_extension, "pdf") == 0) return "application/pdf";
-    if (strcmp(file_extension, "doc") == 0 || strcmp(file_extension, "docx") == 0) return "application/msword";
-    if (strcmp(file_extension, "xls") == 0 || strcmp(file_extension, "xlsx") == 0) return "application/vnd.ms-excel";
-    if (strcmp(file_extension, "ppt") == 0 || strcmp(file_extension, "pptx") == 0) return "application/vnd.ms-powerpoint";
-    if (strcmp(file_extension, "zip") == 0) return "application/zip";
-    if (strcmp(file_extension, "tar") == 0) return "application/x-tar";
-    if (strcmp(file_extension, "gz") == 0) return "application/gzip";
+void parse_body(char *buf, Request *req) {
+    char *cl = strstr(buf, "Content-Length: ");
+    if (!cl) return;
+    req->body_length = strtol(cl + 16, NULL, 10);
+    char *sep = strstr(buf, "\r\n\r\n");
+    req->body_start  = sep ? sep + 4 : NULL;
+}
 
+Request parse_request(char *buf, int fd) {
+    Request req = {0};
+    req.client_fd = fd;
+    parse_path(buf, &req);
+    req.method = parse_method(buf);
+    parse_body(buf, &req);
+    return req;
+}
+
+
+const char *get_mime_type(const char *ext) {
+    if (strcmp(ext, "html") == 0) return "text/html";
+    if (strcmp(ext, "css")  == 0) return "text/css";
+    if (strcmp(ext, "js")   == 0) return "application/javascript";
+    if (strcmp(ext, "png")  == 0) return "image/png";
+    if (strcmp(ext, "jpg")  == 0 || strcmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcmp(ext, "json") == 0) return "application/json";
     return "text/plain";
 }
 
-void send_file(int client_fd, const char *file_path) {
-    const char *last_dot = strrchr(file_path, '.');
-    const char *file_extension = (last_dot) ? last_dot + 1 : "binary";
-    const char *mime_type = get_mime_type(file_extension);
-
+void send_file(int fd, const char *path) {
+    const char *dot  = strrchr(path, '.');
+    const char *mime = get_mime_type(dot ? dot + 1 : "bin");
     char header[BUFFER_SIZE];
-    int file_fd = open(file_path, O_RDONLY);
+    int file_fd = open(path, O_RDONLY);
     if (file_fd < 0) {
-        snprintf(header, sizeof(header), "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404 Not Found</h1>");    
-        send(client_fd, header, strlen(header), 0);
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404 Not Found</h1>");
+        send(fd, header, strlen(header), 0);
         return;
     }
-
-    snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", mime_type);
-    send(client_fd, header, strlen(header), 0);
-    
-    char file_buffer[BUFFER_SIZE];
-    ssize_t bytes_read;
-    while ((bytes_read = read(file_fd, file_buffer, sizeof(file_buffer))) > 0) {
-        send(client_fd, file_buffer, bytes_read, 0);
-        printf("%s", file_buffer);
-    }
+    snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", mime);
+    send(fd, header, strlen(header), 0);
+    char buf[BUFFER_SIZE];
+    ssize_t received;
+    while ((received = read(file_fd, buf, sizeof(buf))) > 0)
+        send(fd, buf, received, 0);
     close(file_fd);
-    return;
 }
 
-void send_text(int client_fd, const char *text) {
+void send_text(int fd, const char *text) {
     char header[BUFFER_SIZE];
-    snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
-    send(client_fd, header, strlen(header), 0);
-    send(client_fd, text, strlen(text), 0);
-    return;
+    snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
+    send(fd, header, strlen(header), 0);
+    send(fd, text, strlen(text), 0);
 }
 
 void build_response(Request *req, PyObject *result) {
     PyObject *type_obj = PyDict_GetItemString(result, "type");
-    if (!type_obj) {
-        PyErr_Print();
-        return;
-    }
+    if (!type_obj) { PyErr_Print(); return; }
     const char *type = PyUnicode_AsUTF8(type_obj);
+
     if (strcmp(type, "file") == 0) {
         PyObject *path_obj = PyDict_GetItemString(result, "path");
-        if (!path_obj) {
-            PyErr_Print();
-            return;
-        }
+        if (!path_obj) {PyErr_Print(); return; }
         const char *file_path = PyUnicode_AsUTF8(path_obj);
         send_file(req->client_fd, file_path);
     } else if (strcmp(type, "text") == 0) {
         PyObject *body_obj = PyDict_GetItemString(result, "body");
-        if (!body_obj) {
-            PyErr_Print();
-            return;
-        }
+        if (!body_obj) {PyErr_Print(); return;}
         const char *body = PyUnicode_AsUTF8(body_obj);
         send_text(req->client_fd, body);
-    }   
+    }
 }
 
-void parse_body(char *buffer, Request *req) {
+void dispatch_request(PyObject *routes, Request *req, const char *method_str) {
+    PyGILState_STATE gstate = PyGILState_Ensure();
 
-    char *content_length_start = strstr(buffer, "Content-Length: ");
-    if (!content_length_start) return;
-    
-    content_length_start += 16;
+    PyObject *key     = PyUnicode_FromFormat("%s:%.*s",
+                            method_str, (int)req->path_length, req->path_start);
+    PyObject *handler = PyDict_GetItem(routes, key);
+    Py_DECREF(key);
 
-    int content_length = strtol(content_length_start, NULL, 10);
+    if (!handler) {
+        send_text(req->client_fd, "<h1>404 Not Found</h1>");
+        PyGILState_Release(gstate);
+        return;
+    }
+    PyObject *result = PyObject_CallNoArgs(handler);
 
-    req->body_start = strstr(buffer, "\r\n\r\n") + 4;
-    req->body_length = content_length;
-    return;
-}
-
-Request parse_request(char *buffer, int client_fd) {
-    Request req;
-
-    req.client_fd = client_fd;
-
-    parse_path(buffer, &req);
-
-    http_method method = parse_method(buffer);
-    req.method = method;
-
-    parse_body(buffer, &req);
-
-    return req;
-}
-
-static PyObject *
-get(PyObject *callable, PyObject *args) {
-    
-}
-
-void *handle_get(PyObject *router, Request *req) {
-    PyGILState_STATE state = PyGILState_Ensure();
-    PyObject *result = PyObject_CallMethod(router, "handle_request","s#", req->path_start, req->path_length);
     if (!result) {
         PyErr_Print();
-        PyGILState_Release(state);
-        return NULL;
+        PyGILState_Release(gstate);
+        return;
     }
+
     build_response(req, result);
-    PyGILState_Release(state);
-    
-}
-
-void handle_post(PyObject *router, Request *req) {
-    
-}
-
-void handle_put(PyObject *router, Request *req) {
-    
-}
-
-void handle_delete(PyObject *router, Request *req) {
-    
-}
-
-void handle_patch(PyObject *router, Request *req) {
-    
+    Py_DECREF(result);
+    PyGILState_Release(gstate);
 }
 
 void *handle_client(void *arg) {
     ClientContext *ctx = (ClientContext *)arg;
-    int client_fd = ctx->client_fd;
-    PyObject *router = ctx->router;
+    int       client_fd = ctx->client_fd;
+    PyObject *routes    = ctx->routes;
     free(arg);
 
-    char buffer[BUFFER_SIZE];
-
-    ssize_t bytes_recieved = recv(client_fd, buffer, BUFFER_SIZE, 0);
-    if (bytes_recieved > 0) {
-        Request req = parse_request(buffer, client_fd);
+    char    buf[BUFFER_SIZE];
+    ssize_t received = recv(client_fd, buf, BUFFER_SIZE - 1, 0);
+    if (received > 0) {
+        buf[received] = '\0';
+        Request req = parse_request(buf, client_fd);
         switch (req.method) {
-            case GET:    
-                printf("GET request\n");
-                handle_get(router, &req);
-                break;
-            case POST:
-                printf("POST request\n");
-                handle_post(router, &req);
-                break;
-            case PUT:
-                handle_put(router, &req);
-                break;
-            case DELETE:
-                handle_delete(router, &req);
-                break;
-            case PATCH:
-                handle_patch(router, &req);
-                break;
-            default:
-                break;
+            case GET:    dispatch_request(routes, &req, "GET");    break;
+            case POST:   dispatch_request(routes, &req, "POST");   break;
+            case PUT:    dispatch_request(routes, &req, "PUT");    break;
+            case DELETE: dispatch_request(routes, &req, "DELETE"); break;
+            case PATCH:  dispatch_request(routes, &req, "PATCH");  break;
+            default: break;
         }
     }
     close(client_fd);
     return NULL;
 }
 
-void accept_loop(PyObject *router, int server_fd) {
+void accept_loop(PyObject *routes, int server_fd) {
     while (1) {
-        struct sockaddr_in client_address;
-        socklen_t client_address_len = sizeof(client_address);
-        int *client_fd = malloc(sizeof(int));
-        
-        if ((*client_fd = accept(server_fd, (struct sockaddr *)&client_address, &client_address_len)) < 0) {
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd,
+                               (struct sockaddr *)&client_addr,
+                               &client_addr_len);
+        if (client_fd < 0) {
             perror("accept failed");
             continue;
         }
-        
+
         ClientContext *ctx = malloc(sizeof(ClientContext));
-        ctx->client_fd = *client_fd;
-        ctx->router = router;
+        ctx->client_fd = client_fd;
+        ctx->routes    = routes;
 
         pthread_t thread_id;
-        pthread_create(&thread_id, NULL, handle_client, (void *)ctx);
+        pthread_create(&thread_id, NULL, handle_client, ctx);
         pthread_detach(thread_id);
     }
 }
 
-int create_server() {
-    struct sockaddr_in address;
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
+int create_server(int port) {
+    struct sockaddr_in addr = {0};
+    int server_fd  = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        return -1;
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind failed"); return -1;
     }
-
-    if (listen(server_fd, 3) < 0) {
-        perror("listen failed");
-        return -1;
+    if (listen(server_fd, 10) < 0) {
+        perror("listen failed"); return -1;
     }
     return server_fd;
 }
 
-int main() {
-    Py_Initialize();
+typedef struct {
+    PyObject_HEAD
+    PyObject *routes;    // structure is: "METHOD:/path"
+    int       server_fd;
+} PyServerObject;
 
-    PyRun_SimpleString("import sys; sys.path.insert(0, '.')");
 
-    PyObject *module_name = PyUnicode_FromString("main");
-    PyObject *module = PyImport_Import(module_name);
-    Py_DECREF(module_name);
+typedef struct {
+    PyObject_HEAD
+    PyServerObject *server;
+    //PyObject       *params;
+    PyObject       *key;      
+} RouteDecoratorObject;
 
-    if (!module) {
-        PyErr_Print();
-        fprintf(stderr, "Failed to import Python module 'main'\n");
-        Py_Finalize();
-        return 1;
+static PyObject *
+route_decorator_call(RouteDecoratorObject *self, PyObject *args, PyObject *kwargs) {
+    PyObject *func;
+    if (!PyArg_ParseTuple(args, "O:__call__", &func)) return NULL;
+    if (!PyCallable_Check(func)) {
+        PyErr_SetString(PyExc_TypeError, "Route handler must be callable");
+        return NULL;
     }
+    PyDict_SetItem(self->server->routes, self->key, func);
+    Py_INCREF(func);
+    return func; 
+}
 
-    PyObject *router = PyObject_GetAttrString(module, "router");
-    if (!router) {
-        PyErr_Print();
-        fprintf(stderr, "Failed to get 'router' from module\n");
-        Py_DECREF(module);
-        Py_Finalize();
-        return 1;
+static void
+route_decorator_dealloc(RouteDecoratorObject *self) {
+    Py_XDECREF(self->key);
+    //Py_XDECREF(self->params);
+    Py_XDECREF(self->server);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyTypeObject RouteDecoratorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "myframework.RouteDecorator",
+    .tp_basicsize = sizeof(RouteDecoratorObject),
+    .tp_call      = (ternaryfunc)route_decorator_call,
+    .tp_dealloc   = (destructor)route_decorator_dealloc,
+    .tp_new       = PyType_GenericNew,
+};
+
+
+static int
+server_init(PyServerObject *self, PyObject *args, PyObject *kwargs) {
+    int port = DEFAULT_PORT;
+    static char *kwlist[] = {"port", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|i", kwlist, &port))
+        return -1;
+
+    self->routes = PyDict_New();
+    if (!self->routes) return -1;
+
+    self->server_fd = create_server(port);
+    if (self->server_fd < 0) {
+        PyErr_SetString(PyExc_OSError, "Failed to bind server socket");
+        return -1;
     }
-
-    int server_fd = create_server();
-    if (server_fd == -1) return 1;
-
-    PyEval_SaveThread();
-
-    accept_loop(router, server_fd);
-    Py_DECREF(router);
-    Py_DECREF(module);
-    Py_Finalize();
-
-    
     return 0;
 }
 
+static void
+server_dealloc(PyServerObject *self) {
+    Py_XDECREF(self->routes);
+    if (self->server_fd >= 0) close(self->server_fd);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *
+make_route_decorator(PyServerObject *self, const char *method, PyObject *args) {
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    RouteDecoratorObject *dec = PyObject_New(RouteDecoratorObject, &RouteDecoratorType);
+    if (!dec) return NULL;
+
+    
+
+
+    dec->key    = PyUnicode_FromFormat("%s:%s", method, path);
+    //dec->params = PyDict_New();
+    dec->server = self;
+    Py_INCREF(self); 
+    return (PyObject *)dec;
+}
+
+static PyObject *server_get   (PyServerObject *self, PyObject *args) { return make_route_decorator(self, "GET",    args); }
+static PyObject *server_post  (PyServerObject *self, PyObject *args) { return make_route_decorator(self, "POST",   args); }
+static PyObject *server_put   (PyServerObject *self, PyObject *args) { return make_route_decorator(self, "PUT",    args); }
+static PyObject *server_delete(PyServerObject *self, PyObject *args) { return make_route_decorator(self, "DELETE", args); }
+static PyObject *server_patch (PyServerObject *self, PyObject *args) { return make_route_decorator(self, "PATCH",  args); }
+
+static PyObject *
+server_run(PyServerObject *self, PyObject *args) {
+    printf("Server listening on port %d\n", DEFAULT_PORT);
+    fflush(stdout);
+
+    Py_BEGIN_ALLOW_THREADS
+    accept_loop(self->routes, self->server_fd);
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef PyServerMethods[] = {
+    {"get",    (PyCFunction)server_get,    METH_VARARGS, "Register a GET route"},
+    {"post",   (PyCFunction)server_post,   METH_VARARGS, "Register a POST route"},
+    {"put",    (PyCFunction)server_put,    METH_VARARGS, "Register a PUT route"},
+    {"delete", (PyCFunction)server_delete, METH_VARARGS, "Register a DELETE route"},
+    {"patch",  (PyCFunction)server_patch,  METH_VARARGS, "Register a PATCH route"},
+    {"run",    (PyCFunction)server_run,    METH_NOARGS,  "Start the server"},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyTypeObject PyServerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "myframework.Server",
+    .tp_basicsize = sizeof(PyServerObject),
+    .tp_init      = (initproc)server_init,
+    .tp_dealloc   = (destructor)server_dealloc,
+    .tp_methods   = PyServerMethods,
+    .tp_new       = PyType_GenericNew,
+};
+
+
+PyMODINIT_FUNC PyInit_myframework(void) {
+    if (PyType_Ready(&RouteDecoratorType) < 0) return NULL;
+    if (PyType_Ready(&PyServerType)       < 0) return NULL;
+
+    static PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "myframework",
+        "A lightweight C-backed HTTP framework",
+        -1,
+        NULL
+    };
+
+    PyObject *m = PyModule_Create(&module_def);
+    if (!m) return NULL;
+
+    Py_INCREF(&PyServerType);
+    if (PyModule_AddObject(m, "Server", (PyObject *)&PyServerType) < 0) {
+        Py_DECREF(&PyServerType);
+        Py_DECREF(m);
+        return NULL;
+    }
+
+    if (signal(SIGINT, SIG_DFL) == SIG_ERR) {
+        perror("signal SIGINT");
+        Py_DECREF(m);
+        return NULL;
+    }
+
+    return m;
+}

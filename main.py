@@ -1,12 +1,24 @@
-# main.py
+import myframework
 
-class Router:
-    def handle_request(self, path: str):
-        if path == "/":
-            return {"type": "text", "body": "<h1>Welcome to my server!</h1>"}
-        elif path == "/file":
-            return {"type": "file", "path": "index.html"}
-        else:
-            return {"type": "text", "body": "<h1>404 Not Found</h1>"}
+app = myframework.Server()
 
-router = Router()
+@app.get("/")
+def index():
+    return {"type": "text", "body": "<h1>Welcome to myframework!</h1>"}
+
+
+@app.get("/hello")
+def hello():    
+    return {"type": "text", "body": "<h1>Hello, World!</h1>"}
+
+@app.get("/user/{id}")
+def user(id):
+    return {"type": "text", "body": f"<h1>User: {id}</h1>"}
+
+@app.get("/file")
+def serve_file():
+    return {"type": "file", "path": "index.html"}
+
+
+if __name__ == "__main__":
+    app.run()
